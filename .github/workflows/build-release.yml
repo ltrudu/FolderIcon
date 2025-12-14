@@ -20,7 +20,18 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Build Release x64
-        run: msbuild FolderIcon.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:OutDir=${{ github.workspace }}\output\
+        run: msbuild FolderIcon.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+
+      - name: List build output
+        run: |
+          echo "Listing bin directory:"
+          dir bin /s /b 2>nul || echo "bin folder not found"
+          echo "Listing x64 directory:"
+          dir x64 /s /b 2>nul || echo "x64 folder not found"
+          echo "Listing Release directories:"
+          dir /s /b *Release* 2>nul || echo "No Release folders found"
+          echo "Finding all exe files:"
+          dir /s /b *.exe 2>nul || echo "No exe files found"
 
       - name: Get version from tag
         id: version
@@ -42,6 +53,8 @@ jobs:
             ### Changes
             See [README.md](README.md) for usage instructions.
           files: |
-            ${{ github.workspace }}/output/FolderIcon.exe
+            bin/Release/FolderIcon.exe
+            x64/Release/FolderIcon.exe
+          fail_on_unmatched_files: false
           draft: false
           prerelease: false
