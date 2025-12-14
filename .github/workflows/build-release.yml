@@ -1,0 +1,47 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release x64
+        run: msbuild FolderIcon.sln /p:Configuration=Release /p:Platform=x64 /p:OutDir=${{ github.workspace }}\output\
+
+      - name: Get version from tag
+        id: version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: FolderIcon ${{ steps.version.outputs.VERSION }}
+          body: |
+            ## FolderIcon ${{ steps.version.outputs.VERSION }}
+
+            ### Installation
+            1. Download `FolderIcon.exe` below
+            2. Place it in a folder of your choice
+            3. Follow the [tutorial](README.md#tutorial-create-a-custom-taskbar-launcher) to set up your taskbar launcher
+
+            ### Changes
+            See [README.md](README.md) for usage instructions.
+          files: |
+            ${{ github.workspace }}/output/FolderIcon.exe
+          draft: false
+          prerelease: false
