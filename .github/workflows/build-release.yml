@@ -22,17 +22,6 @@ jobs:
       - name: Build Release x64
         run: msbuild FolderIcon.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
 
-      - name: List build output
-        run: |
-          echo "Listing bin directory:"
-          dir bin /s /b 2>nul || echo "bin folder not found"
-          echo "Listing x64 directory:"
-          dir x64 /s /b 2>nul || echo "x64 folder not found"
-          echo "Listing Release directories:"
-          dir /s /b *Release* 2>nul || echo "No Release folders found"
-          echo "Finding all exe files:"
-          dir /s /b *.exe 2>nul || echo "No exe files found"
-
       - name: Get version from tag
         id: version
         shell: bash
@@ -52,9 +41,6 @@ jobs:
 
             ### Changes
             See [README.md](README.md) for usage instructions.
-          files: |
-            bin/Release/FolderIcon.exe
-            x64/Release/FolderIcon.exe
-          fail_on_unmatched_files: false
+          files: bin/Release/FolderIcon.exe
           draft: false
           prerelease: false
