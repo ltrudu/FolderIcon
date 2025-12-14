@@ -20,7 +20,7 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Build Release x64
-        run: msbuild FolderIcon.sln /p:Configuration=Release /p:Platform=x64 /p:OutDir=${{ github.workspace }}\output\
+        run: msbuild FolderIcon.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /p:OutDir=${{ github.workspace }}\output\
 
       - name: Get version from tag
         id: version
