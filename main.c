@@ -234,6 +234,66 @@ static BOOL UnregisterContextMenu(void) {
     return success;
 }
 
+static BOOL GetFolderIconLocation(const WCHAR* folderPath, WCHAR* iconPath, int* iconIndex) {
+    // First, check desktop.ini for custom icon
+    WCHAR iniPath[MAX_PATH];
+    swprintf_s(iniPath, MAX_PATH, L"%s\\desktop.ini", folderPath);
+
+    // Try IconResource first (Windows Vista+)
+    WCHAR iconResource[MAX_PATH] = {0};
+    GetPrivateProfileStringW(L"ViewState", L"IconResource", L"",
+                             iconResource, MAX_PATH, iniPath);
+
+    if (!iconResource[0]) {
+        // Try .ShellClassInfo section
+        GetPrivateProfileStringW(L".ShellClassInfo", L"IconResource", L"",
+                                 iconResource, MAX_PATH, iniPath);
+    }
+
+    if (iconResource[0]) {
+        // Parse IconResource format: "path,index" or just "path"
+        WCHAR* comma = wcsrchr(iconResource, L',');
+        if (comma) {
+            *comma = L'\0';
+            *iconIndex = _wtoi(comma + 1);
+        } else {
+            *iconIndex = 0;
+        }
+
+        // Handle relative paths
+        if (iconResource[0] != L'\\' && iconResource[1] != L':') {
+            WCHAR fullPath[MAX_PATH];
+            swprintf_s(fullPath, MAX_PATH, L"%s\\%s", folderPath, iconResource);
+            wcscpy_s(iconPath, MAX_PATH, fullPath);
+        } else {
+            wcscpy_s(iconPath, MAX_PATH, iconResource);
+        }
+        return TRUE;
+    }
+
+    // Try IconFile (older method)
+    WCHAR iconFile[MAX_PATH] = {0};
+    GetPrivateProfileStringW(L".ShellClassInfo", L"IconFile", L"",
+                             iconFile, MAX_PATH, iniPath);
+    if (iconFile[0]) {
+        *iconIndex = GetPrivateProfileIntW(L".ShellClassInfo", L"IconIndex", 0, iniPath);
+
+        if (iconFile[0] != L'\\' && iconFile[1] != L':') {
+            WCHAR fullPath[MAX_PATH];
+            swprintf_s(fullPath, MAX_PATH, L"%s\\%s", folderPath, iconFile);
+            wcscpy_s(iconPath, MAX_PATH, fullPath);
+        } else {
+            wcscpy_s(iconPath, MAX_PATH, iconFile);
+        }
+        return TRUE;
+    }
+
+    // No custom icon found, use default folder icon
+    wcscpy_s(iconPath, MAX_PATH, L"%SystemRoot%\\System32\\shell32.dll");
+    *iconIndex = 3; // Default folder icon
+    return TRUE;
+}
+
 static BOOL CreateFolderIconShortcut(const WCHAR* folderPath) {
     if (!folderPath || !folderPath[0] || !g_exePath[0]) {
         return FALSE;
@@ -262,8 +322,11 @@ static BOOL CreateFolderIconShortcut(const WCHAR* folderPath) {
     if (lastSlash) *lastSlash = L'\0';
     pShellLink->lpVtbl->SetWorkingDirectory(pShellLink, exeDir);
 
-    // Set icon to the folder's icon
-    pShellLink->lpVtbl->SetIconLocation(pShellLink, folderPath, 0);
+    // Get and set the folder's icon
+    WCHAR iconPath[MAX_PATH];
+    int iconIndex = 0;
+    GetFolderIconLocation(folderPath, iconPath, &iconIndex);
+    pShellLink->lpVtbl->SetIconLocation(pShellLink, iconPath, iconIndex);
 
     // Get folder name for description
     WCHAR folderName[MAX_PATH];
@@ -420,6 +483,11 @@ static void LoadFolderContents(void) {
     if (hFind != INVALID_HANDLE_VALUE) {
         do {
             if (wcscmp(findData.cFileName, L".") == 0 || wcscmp(findData.cFileName, L"..") == 0) {
+                continue;
+            }
+
+            // Skip hidden files
+            if (findData.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) {
                 continue;
             }
 
