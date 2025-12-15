@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <stdlib.h>
@@ -16,6 +17,7 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "advapi32.lib")
 
 // DWM constants for Windows 11 (if not already defined)
@@ -39,6 +41,13 @@
 
 #define IDC_LISTVIEW 1001
 #define ID_TIMER_FADE 1
+#define ID_TIMER_CLICK_ANIM 2
+#define CLICK_ANIM_DURATION_MS 2000
+#define CLICK_ANIM_INTERVAL_MS 200
+
+#define IDM_OPEN_FOLDER 2001
+#define IDM_REGISTER_CONTEXT_MENU 2002
+#define IDM_UNREGISTER_CONTEXT_MENU 2003
 
 typedef struct FolderEntry {
     WCHAR szName[MAX_PATH];
@@ -58,6 +67,11 @@ static HWND g_hwndListView = NULL;
 static HWND g_hwndTooltip = NULL;
 static BYTE g_opacity = 0;
 static BOOL g_isClosing = FALSE;
+static int g_hoverIndex = -1;
+static int g_clickedIndex = -1;
+static int g_clickAnimAlpha = 255;
+static BOOL g_clickAnimFading = TRUE;
+static DWORD g_clickAnimStartTime = 0;
 
 // Colors
 static COLORREF g_bgColor;
@@ -65,6 +79,227 @@ static COLORREF g_headerBgColor;
 static COLORREF g_textColor;
 static COLORREF g_statusTextColor;
 static COLORREF g_borderColor;
+static COLORREF g_hoverBgColor;
+
+static WCHAR g_exePath[MAX_PATH] = {0};
+
+static void GetExePath(void) {
+    GetModuleFileNameW(NULL, g_exePath, MAX_PATH);
+}
+
+static void ShowNotification(const WCHAR* title, const WCHAR* message, BOOL isError) {
+    // Create a temporary invisible window for the notification
+    HWND hwndNotify = CreateWindowExW(0, L"STATIC", L"", 0, 0, 0, 0, 0,
+                                       HWND_MESSAGE, NULL, GetModuleHandle(NULL), NULL);
+
+    NOTIFYICONDATAW nid = {0};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwndNotify;
+    nid.uID = 1;
+    nid.uFlags = NIF_ICON | NIF_TIP | NIF_INFO;
+    nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+    nid.dwInfoFlags = isError ? NIIF_ERROR : NIIF_INFO;
+    wcscpy_s(nid.szTip, 64, L"FolderIcon");
+    wcscpy_s(nid.szInfoTitle, 64, title);
+    wcscpy_s(nid.szInfo, 256, message);
+
+    Shell_NotifyIconW(NIM_ADD, &nid);
+
+    // Wait briefly for notification to show, then remove icon
+    Sleep(100);
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+
+    DestroyWindow(hwndNotify);
+}
+
+static BOOL IsRunningAsAdmin(void) {
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+
+    if (AllocateAndInitializeSid(&ntAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                  DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    return isAdmin;
+}
+
+static void RelaunchAsAdmin(const WCHAR* args) {
+    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    sei.lpVerb = L"runas";
+    sei.lpFile = g_exePath;
+    sei.lpParameters = args;
+    sei.nShow = SW_SHOWNORMAL;
+    ShellExecuteExW(&sei);
+}
+
+static BOOL IsContextMenuRegistered(void) {
+    HKEY hKey;
+
+    // Check HKEY_CURRENT_USER first
+    LONG result = RegOpenKeyExW(HKEY_CURRENT_USER,
+        L"Software\\Classes\\Directory\\shell\\AddAsFolderIcon", 0, KEY_READ, &hKey);
+    if (result == ERROR_SUCCESS) {
+        RegCloseKey(hKey);
+        return TRUE;
+    }
+
+    // Check HKEY_CLASSES_ROOT
+    result = RegOpenKeyExW(HKEY_CLASSES_ROOT,
+        L"Directory\\shell\\AddAsFolderIcon", 0, KEY_READ, &hKey);
+    if (result == ERROR_SUCCESS) {
+        RegCloseKey(hKey);
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static BOOL RegisterContextMenuForKey(HKEY hRoot, const WCHAR* basePath) {
+    HKEY hKey, hCommandKey;
+    LONG result;
+    WCHAR keyPath[MAX_PATH];
+    WCHAR commandKeyPath[MAX_PATH];
+
+    swprintf_s(keyPath, MAX_PATH, L"%s\\shell\\AddAsFolderIcon", basePath);
+    swprintf_s(commandKeyPath, MAX_PATH, L"%s\\shell\\AddAsFolderIcon\\command", basePath);
+
+    // Create the main key
+    result = RegCreateKeyExW(hRoot, keyPath, 0, NULL,
+        REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL);
+    if (result != ERROR_SUCCESS) return FALSE;
+
+    // Set display name
+    const WCHAR* displayName = L"Add as FolderIcon";
+    RegSetValueExW(hKey, NULL, 0, REG_SZ, (BYTE*)displayName,
+                   (DWORD)((wcslen(displayName) + 1) * sizeof(WCHAR)));
+
+    // Set icon to FolderIcon.exe
+    RegSetValueExW(hKey, L"Icon", 0, REG_SZ, (BYTE*)g_exePath,
+                   (DWORD)((wcslen(g_exePath) + 1) * sizeof(WCHAR)));
+
+    RegCloseKey(hKey);
+
+    // Create command subkey
+    result = RegCreateKeyExW(hRoot, commandKeyPath, 0, NULL,
+        REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hCommandKey, NULL);
+    if (result != ERROR_SUCCESS) return FALSE;
+
+    // Set command
+    WCHAR command[MAX_PATH * 2];
+    swprintf_s(command, MAX_PATH * 2, L"\"%s\" --add-to-taskbar \"%%1\"", g_exePath);
+    RegSetValueExW(hCommandKey, NULL, 0, REG_SZ, (BYTE*)command,
+                   (DWORD)((wcslen(command) + 1) * sizeof(WCHAR)));
+
+    RegCloseKey(hCommandKey);
+    return TRUE;
+}
+
+static BOOL RegisterContextMenu(void) {
+    BOOL success = FALSE;
+
+    // Try HKEY_CURRENT_USER first (no admin required)
+    if (RegisterContextMenuForKey(HKEY_CURRENT_USER, L"Software\\Classes\\Directory")) {
+        success = TRUE;
+    }
+
+    // Also try HKEY_CLASSES_ROOT if running as admin (system-wide)
+    if (IsRunningAsAdmin()) {
+        if (RegisterContextMenuForKey(HKEY_CLASSES_ROOT, L"Directory")) {
+            success = TRUE;
+        }
+    }
+
+    return success;
+}
+
+static BOOL UnregisterContextMenu(void) {
+    BOOL success = FALSE;
+
+    // Delete from HKEY_CURRENT_USER
+    RegDeleteKeyW(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\shell\\AddAsFolderIcon\\command");
+    if (RegDeleteKeyW(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\shell\\AddAsFolderIcon") == ERROR_SUCCESS) {
+        success = TRUE;
+    }
+
+    // Delete from HKEY_CLASSES_ROOT if running as admin
+    if (IsRunningAsAdmin()) {
+        RegDeleteKeyW(HKEY_CLASSES_ROOT, L"Directory\\shell\\AddAsFolderIcon\\command");
+        if (RegDeleteKeyW(HKEY_CLASSES_ROOT, L"Directory\\shell\\AddAsFolderIcon") == ERROR_SUCCESS) {
+            success = TRUE;
+        }
+    }
+
+    return success;
+}
+
+static BOOL CreateFolderIconShortcut(const WCHAR* folderPath) {
+    if (!folderPath || !folderPath[0] || !g_exePath[0]) {
+        return FALSE;
+    }
+
+    IShellLinkW* pShellLink = NULL;
+    IPersistFile* pPersistFile = NULL;
+    BOOL success = FALSE;
+
+    HRESULT hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                                   &IID_IShellLinkW, (void**)&pShellLink);
+    if (FAILED(hr)) return FALSE;
+
+    // Set shortcut target to FolderIcon.exe
+    pShellLink->lpVtbl->SetPath(pShellLink, g_exePath);
+
+    // Set arguments to the folder path
+    WCHAR args[MAX_PATH + 3];
+    swprintf_s(args, MAX_PATH + 3, L"\"%s\"", folderPath);
+    pShellLink->lpVtbl->SetArguments(pShellLink, args);
+
+    // Set working directory to exe directory
+    WCHAR exeDir[MAX_PATH];
+    wcscpy_s(exeDir, MAX_PATH, g_exePath);
+    WCHAR* lastSlash = wcsrchr(exeDir, L'\\');
+    if (lastSlash) *lastSlash = L'\0';
+    pShellLink->lpVtbl->SetWorkingDirectory(pShellLink, exeDir);
+
+    // Set icon to the folder's icon
+    pShellLink->lpVtbl->SetIconLocation(pShellLink, folderPath, 0);
+
+    // Get folder name for description
+    WCHAR folderName[MAX_PATH];
+    const WCHAR* nameStart = wcsrchr(folderPath, L'\\');
+    if (nameStart && *(nameStart + 1)) {
+        wcscpy_s(folderName, MAX_PATH, nameStart + 1);
+    } else {
+        wcscpy_s(folderName, MAX_PATH, L"FolderIcon");
+    }
+    pShellLink->lpVtbl->SetDescription(pShellLink, folderName);
+
+    // Create shortcut path: same location as folder with "-shortcut" suffix
+    // e.g., C:\Users\Name\MyFolder -> C:\Users\Name\MyFolder-shortcut.lnk
+    WCHAR shortcutPath[MAX_PATH];
+    swprintf_s(shortcutPath, MAX_PATH, L"%s-shortcut.lnk", folderPath);
+
+    // Save shortcut
+    hr = pShellLink->lpVtbl->QueryInterface(pShellLink, &IID_IPersistFile, (void**)&pPersistFile);
+    if (SUCCEEDED(hr)) {
+        hr = pPersistFile->lpVtbl->Save(pPersistFile, shortcutPath, TRUE);
+        if (SUCCEEDED(hr)) {
+            success = TRUE;
+            WCHAR msg[MAX_PATH];
+            swprintf_s(msg, MAX_PATH, L"Shortcut created: %s-shortcut.lnk", folderName);
+            ShowNotification(L"FolderIcon", msg, FALSE);
+        } else {
+            ShowNotification(L"FolderIcon", L"Failed to create shortcut", TRUE);
+        }
+        pPersistFile->lpVtbl->Release(pPersistFile);
+    } else {
+        ShowNotification(L"FolderIcon", L"Failed to create shortcut", TRUE);
+    }
+
+    pShellLink->lpVtbl->Release(pShellLink);
+    return success;
+}
 
 static BOOL IsDarkModeEnabled(void) {
     HKEY hKey;
@@ -89,12 +324,14 @@ static void InitializeColors(void) {
         g_textColor = RGB(255, 255, 255);
         g_statusTextColor = RGB(157, 157, 157);
         g_borderColor = RGB(61, 61, 61);
+        g_hoverBgColor = RGB(65, 65, 65);
     } else {
         g_bgColor = RGB(243, 243, 243);
         g_headerBgColor = RGB(255, 255, 255);
         g_textColor = RGB(26, 26, 26);
         g_statusTextColor = RGB(102, 102, 102);
         g_borderColor = RGB(229, 229, 229);
+        g_hoverBgColor = RGB(225, 225, 225);
     }
 }
 
@@ -136,6 +373,36 @@ static int CompareItems(const void* a, const void* b) {
     return _wcsicmp(itemA->szName, itemB->szName);
 }
 
+static BOOL IsShortcut(const WCHAR* path) {
+    const WCHAR* ext = wcsrchr(path, L'.');
+    return ext && _wcsicmp(ext, L".lnk") == 0;
+}
+
+static BOOL ResolveShortcut(const WCHAR* shortcutPath, WCHAR* targetPath, int targetPathSize) {
+    BOOL success = FALSE;
+    IShellLinkW* pShellLink = NULL;
+    IPersistFile* pPersistFile = NULL;
+
+    HRESULT hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                                   &IID_IShellLinkW, (void**)&pShellLink);
+    if (SUCCEEDED(hr)) {
+        hr = pShellLink->lpVtbl->QueryInterface(pShellLink, &IID_IPersistFile, (void**)&pPersistFile);
+        if (SUCCEEDED(hr)) {
+            hr = pPersistFile->lpVtbl->Load(pPersistFile, shortcutPath, STGM_READ);
+            if (SUCCEEDED(hr)) {
+                hr = pShellLink->lpVtbl->GetPath(pShellLink, targetPath, targetPathSize, NULL, 0);
+                if (SUCCEEDED(hr) && targetPath[0] != L'\0') {
+                    success = TRUE;
+                }
+            }
+            pPersistFile->lpVtbl->Release(pPersistFile);
+        }
+        pShellLink->lpVtbl->Release(pShellLink);
+    }
+
+    return success;
+}
+
 static void LoadFolderContents(void) {
     g_itemCount = 0;
 
@@ -163,9 +430,19 @@ static void LoadFolderContents(void) {
             swprintf_s(item->szPath, MAX_PATH, L"%s\\%s", g_folderPath, findData.cFileName);
             item->bIsDirectory = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 
-            // Get icon
+            // Get icon - for shortcuts, get the target's icon without overlay arrow
+            WCHAR iconPath[MAX_PATH];
+            wcscpy_s(iconPath, MAX_PATH, item->szPath);
+
+            if (IsShortcut(item->szPath)) {
+                WCHAR targetPath[MAX_PATH];
+                if (ResolveShortcut(item->szPath, targetPath, MAX_PATH)) {
+                    wcscpy_s(iconPath, MAX_PATH, targetPath);
+                }
+            }
+
             SHFILEINFOW sfi = {0};
-            SHGetFileInfoW(item->szPath, 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_LARGEICON);
+            SHGetFileInfoW(iconPath, 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_LARGEICON);
 
             if (sfi.hIcon) {
                 item->nIconIndex = ImageList_AddIcon(g_imageList, sfi.hIcon);
@@ -221,9 +498,15 @@ static void PositionWindow(HWND hwnd) {
 
 static void OpenItem(int index) {
     if (index >= 0 && index < g_itemCount) {
+        // Start the application
         ShellExecuteW(NULL, L"open", g_items[index].szPath, NULL, NULL, SW_SHOWNORMAL);
-        g_isClosing = TRUE;
-        SetTimer(g_hwndMain, ID_TIMER_FADE, 10, NULL);
+
+        // Start click animation
+        g_clickedIndex = index;
+        g_clickAnimAlpha = 255;
+        g_clickAnimFading = TRUE;
+        g_clickAnimStartTime = GetTickCount();
+        SetTimer(g_hwndMain, ID_TIMER_CLICK_ANIM, CLICK_ANIM_INTERVAL_MS, NULL);
     }
 }
 
@@ -266,18 +549,43 @@ static void UpdateTooltip(HWND hwndLV, int index) {
 }
 
 static LRESULT CALLBACK ListViewSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
-    static int lastHoverIndex = -1;
-
     switch (msg) {
         case WM_MOUSEMOVE: {
+            // Track mouse to get WM_MOUSELEAVE
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+            TrackMouseEvent(&tme);
+
             LVHITTESTINFO ht = {0};
             ht.pt.x = LOWORD(lParam);
             ht.pt.y = HIWORD(lParam);
             int index = ListView_HitTest(hwnd, &ht);
 
-            if (index != lastHoverIndex) {
-                lastHoverIndex = index;
+            if (index != g_hoverIndex) {
+                int oldIndex = g_hoverIndex;
+                g_hoverIndex = index;
                 UpdateTooltip(hwnd, index);
+
+                // Invalidate old and new items to trigger repaint
+                if (oldIndex >= 0) {
+                    RECT oldRect;
+                    ListView_GetItemRect(hwnd, oldIndex, &oldRect, LVIR_BOUNDS);
+                    InvalidateRect(hwnd, &oldRect, TRUE);
+                }
+                if (index >= 0) {
+                    RECT newRect;
+                    ListView_GetItemRect(hwnd, index, &newRect, LVIR_BOUNDS);
+                    InvalidateRect(hwnd, &newRect, TRUE);
+                }
+            }
+            break;
+        }
+
+        case WM_MOUSELEAVE: {
+            if (g_hoverIndex >= 0) {
+                RECT oldRect;
+                ListView_GetItemRect(hwnd, g_hoverIndex, &oldRect, LVIR_BOUNDS);
+                g_hoverIndex = -1;
+                InvalidateRect(hwnd, &oldRect, TRUE);
             }
             break;
         }
@@ -297,6 +605,52 @@ static LRESULT CALLBACK ListViewSubclassProc(HWND hwnd, UINT msg, WPARAM wParam,
         case WM_SETCURSOR:
             SetCursor(LoadCursor(NULL, IDC_ARROW));
             return TRUE;
+
+        case WM_RBUTTONUP: {
+            LVHITTESTINFO ht = {0};
+            ht.pt.x = LOWORD(lParam);
+            ht.pt.y = HIWORD(lParam);
+            int index = ListView_HitTest(hwnd, &ht);
+
+            // Show context menu only if not clicking on an icon
+            if (index < 0) {
+                POINT screenPt = ht.pt;
+                ClientToScreen(hwnd, &screenPt);
+
+                HMENU hMenu = CreatePopupMenu();
+                AppendMenuW(hMenu, MF_STRING, IDM_OPEN_FOLDER, L"Open folder in Explorer");
+                AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+
+                BOOL isRegistered = IsContextMenuRegistered();
+                if (isRegistered) {
+                    AppendMenuW(hMenu, MF_STRING, IDM_UNREGISTER_CONTEXT_MENU, L"Unregister Explorer context menu");
+                } else {
+                    AppendMenuW(hMenu, MF_STRING, IDM_REGISTER_CONTEXT_MENU, L"Register Explorer context menu");
+                }
+
+                int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                         screenPt.x, screenPt.y, 0, g_hwndMain, NULL);
+                DestroyMenu(hMenu);
+
+                if (cmd == IDM_OPEN_FOLDER) {
+                    ShellExecuteW(NULL, L"open", g_folderPath, NULL, NULL, SW_SHOWNORMAL);
+                } else if (cmd == IDM_REGISTER_CONTEXT_MENU) {
+                    if (RegisterContextMenu()) {
+                        ShowNotification(L"FolderIcon", L"Context menu registered.\nUse 'Show more options' in Explorer.", FALSE);
+                    } else {
+                        ShowNotification(L"FolderIcon", L"Failed to register context menu", TRUE);
+                    }
+                } else if (cmd == IDM_UNREGISTER_CONTEXT_MENU) {
+                    if (UnregisterContextMenu()) {
+                        ShowNotification(L"FolderIcon", L"Context menu unregistered", FALSE);
+                    } else {
+                        ShowNotification(L"FolderIcon", L"Failed to unregister context menu", TRUE);
+                    }
+                }
+                return 0;
+            }
+            break;
+        }
 
         case WM_NCDESTROY:
             RemoveWindowSubclass(hwnd, ListViewSubclassProc, uIdSubclass);
@@ -448,6 +802,40 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     g_opacity -= 25;
                     SetLayeredWindowAttributes(hwnd, 0, g_opacity, LWA_ALPHA);
                 }
+            } else if (wParam == ID_TIMER_CLICK_ANIM) {
+                DWORD elapsed = GetTickCount() - g_clickAnimStartTime;
+
+                // Check if animation duration is over
+                if (elapsed >= CLICK_ANIM_DURATION_MS) {
+                    KillTimer(hwnd, ID_TIMER_CLICK_ANIM);
+                    g_clickedIndex = -1;
+                    g_isClosing = TRUE;
+                    SetTimer(hwnd, ID_TIMER_FADE, 10, NULL);
+                } else {
+                    // Animate alpha: 255 -> 30 -> 255 -> 30 ...
+                    int step = 45;
+                    if (g_clickAnimFading) {
+                        g_clickAnimAlpha -= step;
+                        if (g_clickAnimAlpha <= 30) {
+                            g_clickAnimAlpha = 30;
+                            g_clickAnimFading = FALSE;
+                        }
+                    } else {
+                        g_clickAnimAlpha += step;
+                        if (g_clickAnimAlpha >= 255) {
+                            g_clickAnimAlpha = 255;
+                            g_clickAnimFading = TRUE;
+                        }
+                    }
+
+                    // Invalidate clicked item to redraw
+                    if (g_clickedIndex >= 0) {
+                        RECT itemRect;
+                        ListView_GetItemRect(g_hwndListView, g_clickedIndex, &itemRect, LVIR_BOUNDS);
+                        InflateRect(&itemRect, 4, 4);
+                        InvalidateRect(g_hwndListView, &itemRect, TRUE);
+                    }
+                }
             }
             return 0;
 
@@ -461,6 +849,58 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_ERASEBKGND:
             return 1;
+
+        case WM_NOTIFY: {
+            NMHDR* nmhdr = (NMHDR*)lParam;
+            if (nmhdr->hwndFrom == g_hwndListView && nmhdr->code == NM_CUSTOMDRAW) {
+                NMLVCUSTOMDRAW* lvcd = (NMLVCUSTOMDRAW*)lParam;
+                switch (lvcd->nmcd.dwDrawStage) {
+                    case CDDS_PREPAINT:
+                        return CDRF_NOTIFYITEMDRAW | CDRF_NOTIFYPOSTPAINT;
+
+                    case CDDS_ITEMPREPAINT:
+                        return CDRF_NOTIFYPOSTPAINT;
+
+                    case CDDS_ITEMPOSTPAINT: {
+                        int itemIndex = (int)lvcd->nmcd.dwItemSpec;
+                        BOOL isClicked = (itemIndex == g_clickedIndex && g_clickedIndex >= 0);
+                        BOOL isHovered = (itemIndex == g_hoverIndex && g_hoverIndex >= 0 && !isClicked);
+
+                        if (isClicked || isHovered) {
+                            // Draw rounded border outline
+                            RECT itemRect;
+                            ListView_GetItemRect(g_hwndListView, itemIndex, &itemRect, LVIR_BOUNDS);
+
+                            HDC hdc = lvcd->nmcd.hdc;
+                            HBRUSH oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+
+                            // Calculate pen color with alpha blending for clicked items
+                            COLORREF penColor = g_hoverBgColor;
+                            if (isClicked) {
+                                // Blend hover color with background based on alpha
+                                int alpha = g_clickAnimAlpha;
+                                int r = (GetRValue(g_hoverBgColor) * alpha + GetRValue(g_bgColor) * (255 - alpha)) / 255;
+                                int g = (GetGValue(g_hoverBgColor) * alpha + GetGValue(g_bgColor) * (255 - alpha)) / 255;
+                                int b = (GetBValue(g_hoverBgColor) * alpha + GetBValue(g_bgColor) * (255 - alpha)) / 255;
+                                penColor = RGB(r, g, b);
+                            }
+
+                            HPEN hPen = CreatePen(PS_SOLID, 2, penColor);
+                            HPEN oldPen = SelectObject(hdc, hPen);
+
+                            RoundRect(hdc, itemRect.left + 3, itemRect.top + 3,
+                                      itemRect.right - 3, itemRect.bottom - 3, 8, 8);
+
+                            SelectObject(hdc, oldBrush);
+                            SelectObject(hdc, oldPen);
+                            DeleteObject(hPen);
+                        }
+                        return CDRF_DODEFAULT;
+                    }
+                }
+            }
+            break;
+        }
 
         case WM_ACTIVATE:
             if (LOWORD(wParam) == WA_INACTIVE && !g_isClosing) {
@@ -513,6 +953,40 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     (void)nCmdShow;
 
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    GetExePath();
+
+    // Handle special command line arguments
+    int argc;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv) {
+        for (int i = 1; i < argc; i++) {
+            if (wcscmp(argv[i], L"--register") == 0) {
+                if (RegisterContextMenu()) {
+                    ShowNotification(L"FolderIcon", L"Context menu registered.\nUse 'Show more options' in Explorer.", FALSE);
+                } else {
+                    ShowNotification(L"FolderIcon", L"Failed to register context menu", TRUE);
+                }
+                LocalFree(argv);
+                CoUninitialize();
+                return 0;
+            } else if (wcscmp(argv[i], L"--unregister") == 0) {
+                if (UnregisterContextMenu()) {
+                    ShowNotification(L"FolderIcon", L"Context menu unregistered", FALSE);
+                } else {
+                    ShowNotification(L"FolderIcon", L"Failed to unregister context menu", TRUE);
+                }
+                LocalFree(argv);
+                CoUninitialize();
+                return 0;
+            } else if (wcscmp(argv[i], L"--add-to-taskbar") == 0 && i + 1 < argc) {
+                CreateFolderIconShortcut(argv[i + 1]);
+                LocalFree(argv);
+                CoUninitialize();
+                return 0;
+            }
+        }
+        LocalFree(argv);
+    }
 
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES };
     InitCommonControlsEx(&icc);
