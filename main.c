@@ -413,10 +413,6 @@ static void ParseCommandLine(void) {
         LocalFree(argv);
     }
 
-    if (g_folderPath[0] == 0) {
-        SHGetFolderPathW(NULL, CSIDL_DESKTOP, NULL, 0, g_folderPath);
-    }
-
     // Extract folder name
     WCHAR* lastSlash = wcsrchr(g_folderPath, L'\\');
     if (lastSlash && *(lastSlash + 1)) {
@@ -439,6 +435,31 @@ static int CompareItems(const void* a, const void* b) {
 static BOOL IsShortcut(const WCHAR* path) {
     const WCHAR* ext = wcsrchr(path, L'.');
     return ext && _wcsicmp(ext, L".lnk") == 0;
+}
+
+static BOOL IsUrlShortcut(const WCHAR* path) {
+    const WCHAR* ext = wcsrchr(path, L'.');
+    return ext && _wcsicmp(ext, L".url") == 0;
+}
+
+static HICON GetUrlShortcutIcon(const WCHAR* urlPath) {
+    HICON hIcon = NULL;
+    WCHAR iconFile[MAX_PATH] = {0};
+    WCHAR expandedPath[MAX_PATH] = {0};
+
+    // Read IconFile from the .url file
+    GetPrivateProfileStringW(L"InternetShortcut", L"IconFile", L"",
+                             iconFile, MAX_PATH, urlPath);
+
+    if (iconFile[0] != L'\0') {
+        // Expand environment variables
+        ExpandEnvironmentStringsW(iconFile, expandedPath, MAX_PATH);
+
+        int iconIndex = GetPrivateProfileIntW(L"InternetShortcut", L"IconIndex", 0, urlPath);
+        ExtractIconExW(expandedPath, iconIndex, &hIcon, NULL, 1);
+    }
+
+    return hIcon;
 }
 
 static BOOL ResolveShortcut(const WCHAR* shortcutPath, WCHAR* targetPath, int targetPathSize) {
@@ -464,6 +485,75 @@ static BOOL ResolveShortcut(const WCHAR* shortcutPath, WCHAR* targetPath, int ta
     }
 
     return success;
+}
+
+static HICON GetShortcutIcon(const WCHAR* shortcutPath) {
+    HICON hIcon = NULL;
+    IShellLinkW* pShellLink = NULL;
+    IPersistFile* pPersistFile = NULL;
+    WCHAR targetPath[MAX_PATH] = {0};
+    WCHAR expandedTarget[MAX_PATH] = {0};
+
+    HRESULT hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                                   &IID_IShellLinkW, (void**)&pShellLink);
+    if (SUCCEEDED(hr)) {
+        hr = pShellLink->lpVtbl->QueryInterface(pShellLink, &IID_IPersistFile, (void**)&pPersistFile);
+        if (SUCCEEDED(hr)) {
+            hr = pPersistFile->lpVtbl->Load(pPersistFile, shortcutPath, STGM_READ);
+            if (SUCCEEDED(hr)) {
+                // Get target path first (we may need it for multiple fallbacks)
+                hr = pShellLink->lpVtbl->GetPath(pShellLink, targetPath, MAX_PATH, NULL, 0);
+                if (SUCCEEDED(hr) && targetPath[0] != L'\0') {
+                    ExpandEnvironmentStringsW(targetPath, expandedTarget, MAX_PATH);
+                }
+
+                // Method 1: Try to get icon location from the shortcut metadata
+                WCHAR iconPath[MAX_PATH] = {0};
+                int iconIndex = 0;
+                hr = pShellLink->lpVtbl->GetIconLocation(pShellLink, iconPath, MAX_PATH, &iconIndex);
+
+                if (SUCCEEDED(hr) && iconPath[0] != L'\0') {
+                    // Expand environment variables (e.g., %ProgramFiles%)
+                    WCHAR expandedPath[MAX_PATH] = {0};
+                    ExpandEnvironmentStringsW(iconPath, expandedPath, MAX_PATH);
+
+                    // Extract icon from the specified location
+                    ExtractIconExW(expandedPath, iconIndex, &hIcon, NULL, 1);
+                }
+
+                // Method 2: Try ExtractIconExW directly on target executable
+                if (!hIcon && expandedTarget[0] != L'\0') {
+                    ExtractIconExW(expandedTarget, 0, &hIcon, NULL, 1);
+                }
+
+                // Method 3: Try SHGetFileInfo on target
+                if (!hIcon && expandedTarget[0] != L'\0') {
+                    SHFILEINFOW sfi = {0};
+                    if (SHGetFileInfoW(expandedTarget, 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_LARGEICON)) {
+                        hIcon = sfi.hIcon;
+                    }
+                }
+
+                // Method 4: Try PIDL-based icon extraction for special shortcuts (UWP, shell items)
+                if (!hIcon) {
+                    LPITEMIDLIST pidl = NULL;
+                    hr = pShellLink->lpVtbl->GetIDList(pShellLink, &pidl);
+                    if (SUCCEEDED(hr) && pidl) {
+                        SHFILEINFOW sfi = {0};
+                        if (SHGetFileInfoW((LPCWSTR)pidl, 0, &sfi, sizeof(sfi),
+                                           SHGFI_ICON | SHGFI_LARGEICON | SHGFI_PIDL)) {
+                            hIcon = sfi.hIcon;
+                        }
+                        CoTaskMemFree(pidl);
+                    }
+                }
+            }
+            pPersistFile->lpVtbl->Release(pPersistFile);
+        }
+        pShellLink->lpVtbl->Release(pShellLink);
+    }
+
+    return hIcon;
 }
 
 static void LoadFolderContents(void) {
@@ -498,23 +588,28 @@ static void LoadFolderContents(void) {
             swprintf_s(item->szPath, MAX_PATH, L"%s\\%s", g_folderPath, findData.cFileName);
             item->bIsDirectory = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 
-            // Get icon - for shortcuts, get the target's icon without overlay arrow
-            WCHAR iconPath[MAX_PATH];
-            wcscpy_s(iconPath, MAX_PATH, item->szPath);
+            // Get icon - for shortcuts, use specialized extraction to avoid blank icons
+            HICON hIcon = NULL;
 
             if (IsShortcut(item->szPath)) {
-                WCHAR targetPath[MAX_PATH];
-                if (ResolveShortcut(item->szPath, targetPath, MAX_PATH)) {
-                    wcscpy_s(iconPath, MAX_PATH, targetPath);
+                // Use IShellLink to get icon from shortcut metadata
+                hIcon = GetShortcutIcon(item->szPath);
+            } else if (IsUrlShortcut(item->szPath)) {
+                // Handle .url internet shortcuts
+                hIcon = GetUrlShortcutIcon(item->szPath);
+            }
+
+            // Fallback to SHGetFileInfo for non-shortcuts or if shortcut icon extraction failed
+            if (!hIcon) {
+                SHFILEINFOW sfi = {0};
+                if (SHGetFileInfoW(item->szPath, 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_LARGEICON)) {
+                    hIcon = sfi.hIcon;
                 }
             }
 
-            SHFILEINFOW sfi = {0};
-            SHGetFileInfoW(iconPath, 0, &sfi, sizeof(sfi), SHGFI_ICON | SHGFI_LARGEICON);
-
-            if (sfi.hIcon) {
-                item->nIconIndex = ImageList_AddIcon(g_imageList, sfi.hIcon);
-                DestroyIcon(sfi.hIcon);
+            if (hIcon) {
+                item->nIconIndex = ImageList_AddIcon(g_imageList, hIcon);
+                DestroyIcon(hIcon);
             } else {
                 item->nIconIndex = -1;
             }
@@ -1025,6 +1120,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
 
     // Handle special command line arguments
     int argc;
+    BOOL hasFolder = FALSE;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv) {
         for (int i = 1; i < argc; i++) {
@@ -1051,9 +1147,36 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
                 LocalFree(argv);
                 CoUninitialize();
                 return 0;
+            } else if ((wcscmp(argv[i], L"--folder") == 0 || wcscmp(argv[i], L"-f") == 0) && i + 1 < argc) {
+                hasFolder = TRUE;
+            } else if (argv[i][0] != L'-') {
+                // Check if it's a folder path
+                DWORD attrs = GetFileAttributesW(argv[i]);
+                if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                    hasFolder = TRUE;
+                }
             }
         }
         LocalFree(argv);
+    }
+
+    // No folder argument: toggle context menu registration
+    if (!hasFolder) {
+        if (IsContextMenuRegistered()) {
+            if (UnregisterContextMenu()) {
+                ShowNotification(L"FolderIcon", L"Context menu unregistered", FALSE);
+            } else {
+                ShowNotification(L"FolderIcon", L"Failed to unregister context menu", TRUE);
+            }
+        } else {
+            if (RegisterContextMenu()) {
+                ShowNotification(L"FolderIcon", L"Context menu registered.\nUse 'Show more options' in Explorer.", FALSE);
+            } else {
+                ShowNotification(L"FolderIcon", L"Failed to register context menu", TRUE);
+            }
+        }
+        CoUninitialize();
+        return 0;
     }
 
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES };
