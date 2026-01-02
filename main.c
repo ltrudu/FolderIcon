@@ -33,7 +33,8 @@
 #define MAX_ITEMS 256
 #define ICON_SIZE 32
 #define ICON_PADDING 8
-#define ICON_CELL_SIZE (ICON_SIZE + ICON_PADDING * 2)
+#define ICON_CELL_WIDTH 72
+#define ICON_CELL_HEIGHT 64
 #define HEADER_HEIGHT 36
 #define STATUS_HEIGHT 24
 #define WINDOW_WIDTH 320
@@ -51,6 +52,7 @@
 
 typedef struct FolderEntry {
     WCHAR szName[MAX_PATH];
+    WCHAR szDisplayName[MAX_PATH];
     WCHAR szPath[MAX_PATH];
     BOOL bIsDirectory;
     int nIconIndex;
@@ -432,6 +434,40 @@ static int CompareItems(const void* a, const void* b) {
     return _wcsicmp(itemA->szName, itemB->szName);
 }
 
+static void GetCleanDisplayName(const WCHAR* fileName, BOOL isDirectory, WCHAR* displayName, int maxLen) {
+    wcscpy_s(displayName, maxLen, fileName);
+
+    // Remove file extension (but not for directories)
+    if (!isDirectory) {
+        WCHAR* dot = wcsrchr(displayName, L'.');
+        if (dot && dot != displayName) {
+            *dot = L'\0';
+        }
+    }
+
+    // Remove " - Shortcut" suffix (case insensitive)
+    WCHAR* suffix = wcsstr(displayName, L" - Shortcut");
+    if (!suffix) suffix = wcsstr(displayName, L" - shortcut");
+    if (!suffix) suffix = wcsstr(displayName, L"-Shortcut");
+    if (!suffix) suffix = wcsstr(displayName, L"-shortcut");
+    if (suffix) {
+        *suffix = L'\0';
+    }
+
+    // Also remove common executable extensions that might remain in the name
+    // (in case the shortcut was named "app.exe - Shortcut.lnk")
+    size_t len = wcslen(displayName);
+    if (len > 4) {
+        WCHAR* end = displayName + len - 4;
+        if (_wcsicmp(end, L".exe") == 0 ||
+            _wcsicmp(end, L".msi") == 0 ||
+            _wcsicmp(end, L".bat") == 0 ||
+            _wcsicmp(end, L".cmd") == 0) {
+            *end = L'\0';
+        }
+    }
+}
+
 static BOOL IsShortcut(const WCHAR* path) {
     const WCHAR* ext = wcsrchr(path, L'.');
     return ext && _wcsicmp(ext, L".lnk") == 0;
@@ -587,6 +623,7 @@ static void LoadFolderContents(void) {
             wcscpy_s(item->szName, MAX_PATH, findData.cFileName);
             swprintf_s(item->szPath, MAX_PATH, L"%s\\%s", g_folderPath, findData.cFileName);
             item->bIsDirectory = (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            GetCleanDisplayName(item->szName, item->bIsDirectory, item->szDisplayName, MAX_PATH);
 
             // Get icon - for shortcuts, use specialized extraction to avoid blank icons
             HICON hIcon = NULL;
@@ -695,15 +732,8 @@ static void UpdateTooltip(HWND hwndLV, int index) {
     SendMessageW(g_hwndTooltip, TTM_DELTOOLW, 0, (LPARAM)&ti);
 
     if (index >= 0 && index < g_itemCount) {
-        wcscpy_s(g_tooltipText, MAX_PATH, g_items[index].szName);
-
-        // Remove extension for files (not folders)
-        if (!g_items[index].bIsDirectory) {
-            WCHAR* dot = wcsrchr(g_tooltipText, L'.');
-            if (dot && dot != g_tooltipText) {
-                *dot = L'\0';
-            }
-        }
+        // Use the clean display name for tooltip
+        wcscpy_s(g_tooltipText, MAX_PATH, g_items[index].szDisplayName);
 
         ti.lpszText = g_tooltipText;
         SendMessageW(g_hwndTooltip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
@@ -835,19 +865,20 @@ static void CreateListView(HWND hwndParent) {
         hwndParent, (HMENU)IDC_LISTVIEW, GetModuleHandle(NULL), NULL);
 
     ListView_SetImageList(g_hwndListView, g_imageList, LVSIL_NORMAL);
-    ListView_SetIconSpacing(g_hwndListView, ICON_CELL_SIZE, ICON_CELL_SIZE);
+    ListView_SetIconSpacing(g_hwndListView, ICON_CELL_WIDTH, ICON_CELL_HEIGHT);
     ListView_SetExtendedListViewStyle(g_hwndListView, LVS_EX_DOUBLEBUFFER);
 
     // Set colors
     ListView_SetBkColor(g_hwndListView, g_bgColor);
     ListView_SetTextBkColor(g_hwndListView, g_bgColor);
-    ListView_SetTextColor(g_hwndListView, g_bgColor); // Hide text, show in tooltip only
+    ListView_SetTextColor(g_hwndListView, g_textColor); // Show text under icons
 
     // Populate items
     for (int i = 0; i < g_itemCount; i++) {
         LVITEMW lvi = {0};
-        lvi.mask = LVIF_IMAGE | LVIF_PARAM;
+        lvi.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_PARAM;
         lvi.iItem = i;
+        lvi.pszText = g_items[i].szDisplayName;
         lvi.iImage = g_items[i].nIconIndex;
         lvi.lParam = i;
         ListView_InsertItem(g_hwndListView, &lvi);
