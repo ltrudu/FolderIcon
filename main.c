@@ -696,10 +696,69 @@ static void PositionWindow(HWND hwnd) {
     SetWindowPos(hwnd, NULL, left, top, WINDOW_WIDTH, WINDOW_HEIGHT, SWP_NOZORDER);
 }
 
+static BOOL IsScriptFile(const WCHAR* path, WCHAR* extension) {
+    const WCHAR* ext = wcsrchr(path, L'.');
+    if (ext) {
+        if (_wcsicmp(ext, L".ps1") == 0) {
+            if (extension) wcscpy_s(extension, 8, L".ps1");
+            return TRUE;
+        }
+        if (_wcsicmp(ext, L".bat") == 0) {
+            if (extension) wcscpy_s(extension, 8, L".bat");
+            return TRUE;
+        }
+        if (_wcsicmp(ext, L".cmd") == 0) {
+            if (extension) wcscpy_s(extension, 8, L".cmd");
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static void ExecuteScript(const WCHAR* scriptPath, const WCHAR* extension) {
+    WCHAR workingDir[MAX_PATH] = {0};
+    wcscpy_s(workingDir, MAX_PATH, scriptPath);
+    WCHAR* lastSlash = wcsrchr(workingDir, L'\\');
+    if (lastSlash) *lastSlash = L'\0';
+
+    if (_wcsicmp(extension, L".ps1") == 0) {
+        // Execute PowerShell script
+        WCHAR params[MAX_PATH * 2];
+        swprintf_s(params, MAX_PATH * 2, L"-ExecutionPolicy Bypass -File \"%s\"", scriptPath);
+        ShellExecuteW(NULL, L"open", L"powershell.exe", params, workingDir, SW_SHOWNORMAL);
+    } else {
+        // Execute .bat or .cmd - use cmd.exe to ensure proper execution
+        WCHAR params[MAX_PATH * 2];
+        swprintf_s(params, MAX_PATH * 2, L"/c \"%s\"", scriptPath);
+        ShellExecuteW(NULL, L"open", L"cmd.exe", params, workingDir, SW_SHOWNORMAL);
+    }
+}
+
 static void OpenItem(int index) {
     if (index >= 0 && index < g_itemCount) {
-        // Start the application
-        ShellExecuteW(NULL, L"open", g_items[index].szPath, NULL, NULL, SW_SHOWNORMAL);
+        const WCHAR* itemPath = g_items[index].szPath;
+        WCHAR targetPath[MAX_PATH] = {0};
+        WCHAR scriptExt[8] = {0};
+
+        // Check if it's a shortcut and resolve target for script detection
+        if (IsShortcut(itemPath)) {
+            if (ResolveShortcut(itemPath, targetPath, MAX_PATH)) {
+                // Expand environment variables in target path
+                WCHAR expandedTarget[MAX_PATH] = {0};
+                ExpandEnvironmentStringsW(targetPath, expandedTarget, MAX_PATH);
+                wcscpy_s(targetPath, MAX_PATH, expandedTarget);
+            }
+        } else {
+            wcscpy_s(targetPath, MAX_PATH, itemPath);
+        }
+
+        // Check if target is a script file
+        if (targetPath[0] != L'\0' && IsScriptFile(targetPath, scriptExt)) {
+            ExecuteScript(targetPath, scriptExt);
+        } else {
+            // Regular file or application - use standard shell execute
+            ShellExecuteW(NULL, L"open", itemPath, NULL, NULL, SW_SHOWNORMAL);
+        }
 
         // Start click animation
         g_clickedIndex = index;
